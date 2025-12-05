@@ -8,7 +8,8 @@ xformers>=0.0.23.post1
 liger-kernel==0.6.4
 # END section
 
-packaging==23.2
+# packaging==23.2
+packaging>=24.2
 
 huggingface_hub>=0.36.0
 peft>=0.18.0
@@ -25,7 +26,7 @@ trackio
 optimum==1.16.2
 hf_transfer
 sentencepiece
-gradio==5.49.1
+# gradio==5.49.1
 
 modal==1.0.2
 pydantic>=2.10.6
