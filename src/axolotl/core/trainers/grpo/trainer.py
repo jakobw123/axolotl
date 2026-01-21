@@ -1,9 +1,13 @@
 """Axolotl GRPO trainers (with and without sequence parallelism handling)"""
 
+from collections.abc import Callable
 import warnings
 from functools import partial
 from typing import Any
 
+from axolotl.custom_parts.code_interpreter.python_executor import PythonExecutor
+from axolotl.custom_parts.parser import Parser
+from axolotl.custom_parts.reference_builder import ReferenceBuilder
 import datasets
 import torch
 import torch.distributed as dist
@@ -12,7 +16,7 @@ from accelerate.utils import (
     broadcast_object_list,
     gather,
     gather_object,
-    is_peft_available,
+    is_peft_available
 )
 from datasets import Dataset, IterableDataset
 from torch import nn
@@ -34,10 +38,11 @@ from trl.data_utils import (
     is_conversational,
     maybe_apply_chat_template,
 )
+from trl.import_utils import is_vllm_available
 from trl.extras.profiling import profiling_context
 from trl.models import unwrap_model_for_generation
 from trl.trainer.grpo_config import GRPOConfig
-from trl.trainer.grpo_trainer import RewardFunc, nanstd
+from trl.trainer.grpo_trainer import RewardFunc, nanstd, RolloutFunc
 from trl.trainer.utils import pad
 
 from axolotl.core.trainers.grpo.sampler import SequenceParallelRepeatRandomSampler
@@ -51,6 +56,10 @@ from axolotl.monkeypatch.ring_attn import get_ring_attn_group
 
 if is_peft_available():
     from peft import PeftConfig
+    
+if is_vllm_available():
+    from vllm import LLM, SamplingParams
+    from vllm.sampling_params import GuidedDecodingParams
 
 
 class AxolotlGRPOTrainer(
@@ -64,8 +73,89 @@ class AxolotlGRPOTrainer(
     """Extend the base GRPOTrainer for axolotl helpers"""
 
     _tag_names = ["trl", "grpo", "axolotl"]
+    
+    def __init(
+        self,
+        model: str | PreTrainedModel,
+        reward_funcs: RewardFunc | list[RewardFunc],
+        args: GRPOConfig | None = None,
+        train_dataset: Dataset | IterableDataset | None = None,
+        eval_dataset: (
+            Dataset | IterableDataset | dict[str, Dataset | IterableDataset] | None
+        ) = None,
+        processing_class: PreTrainedTokenizerBase | None = None,
+        reward_processing_classes: (
+            PreTrainedTokenizerBase | list[PreTrainedTokenizerBase] | None
+        ) = None,
+        callbacks: list[TrainerCallback] | None = None,
+        optimizers: tuple[
+            torch.optim.Optimizer | None, torch.optim.lr_scheduler.LambdaLR | None
+        ] = (None, None),
+        peft_config: "PeftConfig | None" = None,
+        tools: list[Callable] | None = None,
+        rollout_func: RolloutFunc | None = None
+    ):
+        super().__init__(
+            model=model,
+            reward_funcs=reward_funcs,
+            args=args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=processing_class,
+            reward_processing_classes=reward_processing_classes,
+            callbacks=callbacks,
+            optimizers=optimizers,
+            peft_config=peft_config,
+            tools=tools,
+            rollout_func=rollout_func
+        )
+        
+        self.code_executor: PythonExecutor = None
+        if self.args.use_code_executor and self.args.sandbox_python_path and self.args.sandbox_script_path:
+            
+            self.code_executor = PythonExecutor(
+                sandbox_python_path=self.args.sandbox_python_path,
+                server_script_path=self.args.sandbox_script_path,
+                get_answer_from_stdout=True,
+                # hard_timeout_padding=timeout,
+                local_num_procs=self.args.local_num_procs if self.args.local_num_procs else 1
+            )
+        
+        data_role_map_and_pretag = getattr(self.args, "data_role_map_and_pretag", {})
+        output_roles = getattr(self.args, "output_roles", {})
+        
+        self.parser_registry = {}
+        self.builder_registry = {}
+        
+        for task_type, (data_role_map, is_pre_tagged) in data_role_map_and_pretag.items():
+            p = Parser()
+            b = ReferenceBuilder()
 
+            if output_roles:
+                p.configure(output_roles=output_roles)
 
+            b.configure(
+                roles=output_roles,
+                parser=p,
+                data_role_map=data_role_map,
+                data_is_pre_tagged=is_pre_tagged,
+                output_template=output_roles
+            )
+
+            # Store in registry
+            self.parser_registry[task_type] = p
+            self.builder_registry[task_type] = b
+        
+        active_engine = getattr(self, "vllm_client", None) or getattr(self, "llm", None)
+        
+        for reward_fn in self.reward_funcs:
+            # Check if this reward function is our SelfReward type
+            if active_engine and hasattr(reward_fn, "set_vllm_engine"):
+                reward_fn.set_vllm_engine(active_engine)
+
+            if hasattr(reward_fn, "set_context"):
+                reward_fn.set_context(self.parser_registry, self.builder_registry)
+                
 class AxolotlGRPOSequenceParallelTrainer(AxolotlGRPOTrainer):
     """Extend the base GRPOTrainer for sequence parallelism handling"""
 
@@ -88,6 +178,7 @@ class AxolotlGRPOSequenceParallelTrainer(AxolotlGRPOTrainer):
         ] = (None, None),
         peft_config: "PeftConfig | None" = None,
         optimizer_cls_and_kwargs: tuple[type, dict] | None = None,
+        rollout_func: RolloutFunc | None = None
     ):
         # First call the superclass constructor with all arguments
         super().__init__(
@@ -102,6 +193,7 @@ class AxolotlGRPOSequenceParallelTrainer(AxolotlGRPOTrainer):
             optimizers=optimizers,
             peft_config=peft_config,
             optimizer_cls_and_kwargs=optimizer_cls_and_kwargs,
+            rollout_func=rollout_func
         )
 
         # Get number of SP groups (number of processes divided by SP degree)
@@ -305,6 +397,7 @@ class AxolotlGRPOSequenceParallelTrainer(AxolotlGRPOTrainer):
         # Generate completions using either vLLM or regular generation
         if self.args.use_vllm:
             # First, have main process load weights if needed
+            custom_mask_list = None
 
             if self.state.global_step != self._last_loaded_step:  # type: ignore[has-type]
                 self._move_model_to_vllm()
@@ -344,26 +437,94 @@ class AxolotlGRPOSequenceParallelTrainer(AxolotlGRPOTrainer):
                     ordered_set_of_prompts = all_prompts_text[
                         :: self.num_generations * self.args.context_parallel_size
                     ]
+                    
+                if self.rollout_func is not None:
+                    # Use custom rollout (handles multi-turn/tools)
+                    # We pass the deduped prompts prepared by Axolotl above
+                    # rollout_prompts = ordered_set_of_prompts
+                    # if rollout_prompts and is_conversational({"prompt": rollout_prompts[0]}):
+                    #     rollout_prompts = [
+                    #         apply_chat_template(
+                    #             {"prompt": p}, self.processing_class, **self.chat_template_kwargs
+                    #         )["prompt"]
+                    #         for p in rollout_prompts
+                    #     ]
+                    with profiling_context(self, "vLLM.generate"):
+                        rollout_output = self.rollout_func(ordered_set_of_prompts, self)
+                    
+                    completion_ids = rollout_output.get("completion_ids", [])
+                    custom_mask_list = rollout_output.get("completion_mask", None)
+                    
+                elif hasattr(self, "llm") and self.llm is not None:
+                    if self.guided_decoding_regex:
+                        guided_decoding = GuidedDecodingParams(regex=self.guided_decoding_regex)
+                        
+                    else:
+                        guided_decoding = None
 
-                with profiling_context(self, "vLLM.generate"):
-                    completion_ids = self.vllm_client.generate(
-                        prompts=ordered_set_of_prompts,
-                        n=self.num_generations,
-                        repetition_penalty=self.repetition_penalty,
-                        temperature=self.temperature,
-                        top_p=self.top_p,
-                        top_k=-1 if self.top_k is None else self.top_k,
-                        min_p=0.0 if self.min_p is None else self.min_p,
-                        max_tokens=self.max_completion_length,
-                        guided_decoding_regex=self.guided_decoding_regex,
-                    )
+                    generation_kwargs = {
+                        "n": 1,  # vLLM on each GPU generates only 1 in colocate mode
+                        "repetition_penalty": self.repetition_penalty,
+                        "temperature": self.temperature,
+                        "top_p": self.top_p,
+                        "top_k": -1 if self.top_k is None else self.top_k,
+                        "min_p": 0.0 if self.min_p is None else self.min_p,
+                        "max_tokens": self.max_completion_length,
+                        "guided_decoding": guided_decoding,
+                        "logprobs": 0,  # enable returning log probabilities; 0 means for the sampled tokens only
+                    }
+                    
+                    if self.args.generation_kwargs is not None:
+                        generation_kwargs.update(self.args.generation_kwargs)
+                        
+                    sampling_params = SamplingParams(**generation_kwargs)
+                    
+                    with profiling_context(self, "vLLM.generate"):
+                        req_outputs = self.llm.generate(ordered_set_of_prompts, sampling_params=sampling_params, use_tqdm=False)
+                    
+                    # Flatten results: vLLM returns [ReqOutput(outputs=[Comp1, Comp2]), ...]
+                    # Flat list: [Comp1_P1, Comp2_P1, Comp1_P2, Comp2_P2, ...]
+                    completion_ids = [output.token_ids for req in req_outputs for output in req.outputs]
+                    
+                else:
+                    num_generations = self.num_generations if mode == "train" else self.num_generations_eval
+                    
+                    sampling_params = {
+                        "n": num_generations,
+                        "repetition_penalty": self.repetition_penalty,
+                        "temperature": self.temperature,
+                        "top_p": self.top_p,
+                        "top_k": -1 if self.top_k is None else self.top_k,
+                        "min_p": 0.0 if self.min_p is None else self.min_p,
+                        "max_tokens": self.max_completion_length,
+                        "guided_decoding_regex": self.guided_decoding_regex,
+                        "generation_kwargs": self.args.generation_kwargs,
+                    }
+
+                    with profiling_context(self, "vLLM.generate"):
+                        output = self.vllm_client.generate(
+                            prompts=ordered_set_of_prompts,
+                            **sampling_params
+                        )
+                        
+                        if isinstance(output, dict) and "completion_ids" in output:
+                            completion_ids = output["completion_ids"]
+                        else:
+                            completion_ids = output
             else:
                 completion_ids = [None] * (
+                    len(all_prompts_text) // self.args.context_parallel_size
+                )
+                custom_mask_list = [None] * (
                     len(all_prompts_text) // self.args.context_parallel_size
                 )
 
             # Broadcast the completions from the main process to all processes
             completion_ids = broadcast_object_list(completion_ids, from_process=0)
+            
+            has_mask = self.accelerator.gather(torch.tensor([1 if custom_mask_list is not None else 0], device=device)).sum() > 0
+            if has_mask:
+                custom_mask_list = broadcast_object_list(custom_mask_list, from_process=0)
 
             # Determine the appropriate slice based on sequence parallelism
             if self.args.context_parallel_size > 1:
@@ -378,14 +539,23 @@ class AxolotlGRPOSequenceParallelTrainer(AxolotlGRPOTrainer):
                     sp_group_start,
                     sp_group_start + len(prompts),
                 )
+                
                 completion_ids = completion_ids[process_slice]
+                    
+                if custom_mask_list:
+                    custom_mask_list = custom_mask_list[process_slice]
+
             else:
                 # Original behavior for non-sequence parallel case
                 process_slice = slice(
                     self.accelerator.process_index * len(prompts),
                     (self.accelerator.process_index + 1) * len(prompts),
                 )
+            
                 completion_ids = completion_ids[process_slice]
+                    
+                if custom_mask_list:
+                    custom_mask_list = custom_mask_list[process_slice]
 
             # Pad the completions, and concatenate them with the prompts
             completion_ids = [
@@ -395,6 +565,15 @@ class AxolotlGRPOSequenceParallelTrainer(AxolotlGRPOTrainer):
                 completion_ids, padding_value=self.processing_class.pad_token_id
             )
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            
+            if custom_mask_list is not None:
+                completion_mask = [torch.tensor(m, device=device) for m in custom_mask_list]
+                completion_mask = pad(completion_mask, padding_value=0) # Pad with 0 (ignore)
+                
+            else:
+                completion_mask = [torch.ones_like(ids) for ids in completion_ids]
+                completion_mask = pad(completion_mask, padding_value=0)
+            
         else:
             # Regular generation path
             with unwrap_model_for_generation(

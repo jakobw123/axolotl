@@ -1,7 +1,8 @@
 """Pydantic models for TRL trainer configuration"""
 
-from typing import Literal
+from typing import Any, Dict, Literal, TypedDict
 
+from axolotl.custom_parts.utils import RoleConfig
 from pydantic import BaseModel, Field
 
 
@@ -179,3 +180,34 @@ class TRLConfig(BaseModel):
             "description": "Path to custom rollout function. Must be importable from current dir."
         },
     )
+    
+    data_role_map_and_pretag: dict[str, tuple[dict[str, str], bool]] | None = Field(
+        default=None, 
+        description="Per Task: 1. Mapping from dataset columns to output roles for the Parser. 2. Whether the dataset reference is already tagged with roles."
+    )
+    output_roles: dict[str, RoleConfig] | None = Field(
+        default=None, 
+        description="List of expected output roles for the ReferenceBuilder."
+    )
+    
+    use_code_executor: bool = Field(
+        default=False, 
+        description="Whether to construct a code executor instance in the GRPO trainer."
+    )
+    max_turns: int = Field(
+        default=5, 
+        description="Number of code interleaved turns to allow."
+    )
+    sandbox_python_path: str | None = Field(
+        default=None, 
+        description="Path to the sandbox python interpreter."
+    )
+    sandbox_script_path: str | None = Field(
+        default=None, 
+        description="Path to the sandbox script that is run to execute code."
+    )
+    local_num_procs: int = Field(
+        default=1, 
+        description="Number of processes can be used in the generation process or reward functions."
+    )
+    
