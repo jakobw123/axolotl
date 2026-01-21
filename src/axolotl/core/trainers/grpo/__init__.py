@@ -128,6 +128,32 @@ class GRPOStrategy:
 
         if trl.rollout_func:
             grpo_args_kwargs["rollout_func"] = cls.get_rollout_func(trl.rollout_func)
+            
+            
+            
+        if trl.data_role_map_and_pretag is not None:
+            grpo_args_kwargs["data_role_map_and_pretag"] = trl.data_role_map_and_pretag
+            
+        if trl.output_roles is not None:
+            grpo_args_kwargs["output_roles"] = trl.output_roles
+            
+        if trl.use_code_executor:
+            grpo_args_kwargs["use_code_executor"] = trl.use_code_executor
+            
+            if trl.max_turns is not None:
+                grpo_args_kwargs["max_turns"] = trl.max_turns
+                
+            if trl.sandbox_python_path is not None:
+                grpo_args_kwargs["sandbox_python_path"] = trl.sandbox_python_path
+                
+            if trl.sandbox_script_path is not None:
+                grpo_args_kwargs["sandbox_script_path"] = trl.sandbox_script_path
+                
+            if trl.local_num_procs is not None:
+                grpo_args_kwargs["local_num_procs"] = trl.local_num_procs
+                
+        if vllm_cfg.enable_prefix_caching is not None:
+            grpo_args_kwargs["vllm_enable_prefix_caching"] = vllm_cfg.enable_prefix_caching
 
         if trl.multi_objective_aggregation is not None:
             grpo_args_kwargs["multi_objective_aggregation"] = (

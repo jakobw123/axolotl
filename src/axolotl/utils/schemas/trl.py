@@ -1,7 +1,8 @@
 """Pydantic models for TRL trainer configuration"""
 
-from typing import Literal
+from typing import Any, Dict, Literal, TypedDict
 
+from axolotl.custom_parts.utils import RoleConfig
 from pydantic import BaseModel, Field
 
 
