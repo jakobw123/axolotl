@@ -8,9 +8,9 @@ from typing import Any
 from packaging.version import Version
 
 import transformers
-from axolotl.custom_parts.code_interpreter.python_executor import PythonExecutor
-from axolotl.custom_parts.parser import Parser
-from axolotl.custom_parts.reference_builder import ReferenceBuilder
+from .......src.code_interpreter.python_executor import PythonExecutor
+from .......src.output_handler.parsing.base import Parser
+from .......src.output_handler.references.base import ReferenceBuilder
 import datasets
 import torch
 import torch.distributed as dist

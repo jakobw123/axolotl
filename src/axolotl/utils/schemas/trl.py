@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, Literal, TypedDict
 
-from axolotl.custom_parts.utils import RoleConfig
+from ......src.output_handler.utils import RoleConfig
 from pydantic import BaseModel, Field
 
 
