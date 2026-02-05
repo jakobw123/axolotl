@@ -1,8 +1,6 @@
 """Pydantic models for TRL trainer configuration"""
 
 from typing import Any, Dict, Literal, TypedDict
-
-from ......src.output_handler.utils import RoleConfig
 from pydantic import BaseModel, Field
 
 
