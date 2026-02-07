@@ -1340,14 +1340,31 @@ class ComplexValidationMixin:
     @model_validator(mode="after")
     def check_early_stopping(self):
         if self.early_stopping_patience:
-            if not self.save_steps or not self.eval_steps:
+            if (not self.saves_per_epoch or not self.evals_per_epoch) and (not self.save_steps or not self.eval_steps):
                 raise ValueError(
-                    "`early_stopping_patience` requires save_steps and eval_steps to be set. eval_steps should evenly divide save_steps."
+                    "`early_stopping_patience` requires saves_per_epoch and evals_per_epoch or save_steps and eval_steps to be set. \
+                    saves_per_epoch should be evenly divisible by evals_per_epoch or eval_steps should evenly divide save_steps."
                 )
-            if self.save_steps % self.eval_steps != 0:
+            if self.saves_per_epoch and self.evals_per_epoch and self.save_steps and self.eval_steps:
                 raise ValueError(
-                    "`early_stopping_patience` requires that eval_steps should evenly divide save_steps."
+                    "Either use saves_per_epoch and evals_per_epoch or save_steps and eval_steps not both."
                 )
+                
+            if self.saves_per_epoch and self.evals_per_epoch:
+                
+                
+                if self.evals_per_epoch % self.saves_per_epoch != 0:
+                    raise ValueError(
+                        "`early_stopping_patience` requires that saves_per_epoch should evenly divide evals_per_epoch."
+                    )
+                    
+            if self.save_steps and self.eval_steps:
+                
+                if self.save_steps % self.eval_steps != 0:
+                    raise ValueError(
+                        "`early_stopping_patience` requires that eval_steps should evenly divide save_steps."
+                    )
+                    
         return self
 
     @model_validator(mode="after")
